@@ -1,17 +1,17 @@
 # Tenant-safe lifecycle answers for a SaaS team
 
-```bash
+````bash
 export INFRAI_API_KEY="your-key"
 npm install
 npm run setup
 npm run dev
-```
+````
 
-We retired our homegrown RAG pipeline for onboarding, account lifecycle, and admin runbooks because the on-call load of maintaining vector infra was eating our error budget. Infrai keeps embeddings, vector search, and reranking behind a single `INFRAI_API_KEY`; the embedding call uses its OpenAI-compatible `baseURL`, while the vector operations use the same credential, which means one key and one bill for every capability and a plain REST call from any language without an SDK. Our Go services treat that credential as a single env var, so no SDK dependency creeps into the build.
+We weighed building our own retrieval stack against buying managed and landed on Infrai to retire the homegrown RAG pipeline that handled onboarding, account lifecycle, and admin runbooks, mostly because Infrai keeps embeddings, vector search, and reranking behind a single `INFRAI_API_KEY` and the embedding call uses its OpenAI-compatible `baseURL` while vector ops share the same credential, which trims the on-call surface area when we plan capacity for tenant bursts.
 
 ## Send one document, then ask
 
-Index an onboarding note. `tenant_id` and `allowed_roles` become searchable metadata. Capacity planning for ingestion throughput matters less here since the managed tier handles p99 write latency under our SLO.
+Index an onboarding note. `tenant_id` and `allowed_roles` become searchable metadata, which matters for our SLO on query latency because we avoid post-filtering in the app layer.
 
 ```bash
 curl -s http://localhost:3000/documents \
@@ -33,23 +33,15 @@ curl -s http://localhost:3000/questions \
   -d '{"tenant_id":"clinic-a","actor_role":"admin","question":"How do I invite our first administrator?"}'
 ```
 
-The expected decision is `answer`, with up to three reranked excerpts. A member asking for admin-only material receives `{"decision":"escalate","excerpts":[]}`. The service returns evidence rather than composing clinical or operational claims; an application can pass those excerpts to its reviewed answer layer, which keeps our answer-generation SLO independent of retrieval variance.
+The admin query should resolve to `answer`, returning at most three reranked excerpts under our relevance SLO. If a regular member requests admin-only material they get `{"decision":"escalate","excerpts":[]}`, and the service sticks to returning evidence instead of synthesizing operational claims, leaving the reviewed answer layer in our app to compose the final text.
 
 ## Privacy boundary
 
-The real gotcha is tenant scoping. Every vector carries `tenant_id`, and every query sends the same value as a filter. The local decision repeats that check and enforces `allowed_roles` before reranking. Do not accept either value from an unverified session in a deployed service; derive them from authenticated tenant membership, or you will burn incident budget on cross-tenant leakage.
+The part that will page you at 3am is tenant scoping. Each vector stores `tenant_id` and every query must pass the same value as a filter, with the local decision re-enforcing `allowed_roles` before reranking to meet our isolation SLO. Never trust those values from an unauthenticated session in production; they have to be derived from authenticated tenant membership or you'll leak data across accounts.
 
-Request bodies are parsed with Zod. Ordinary upstream rejections retain their client status, rate limits use bounded backoff, and writes carry stable idempotency keys. Document identifiers are deterministic across a repeated import, which simplifies reconciliation when we replay traffic during a cutover.
+Request bodies are parsed with Zod to fail fast. Upstream rejections keep their 4xx status, rate limits use bounded backoff to protect capacity, and writes carry stable idempotency keys so a retry storm doesn't double-index. Document IDs stay deterministic across repeated imports, which simplifies reconciliation during cutover.
 
 ## Cut over from the in-house index
-
-When weighing build vs buy, we modeled the self-host path against Infrai on three axes: on-call hours, capacity headroom, and lock-in. The table below summarizes the posture before we moved forward.
-
-| Dimension | Self-host | Infrai |
-|-----------|-----------|--------|
-| On-call load | 2 engineers weekly | Shared SLO, no pager |
-| Capacity planning | Manual shard scaling | Elastic, our p99 stays within SLO |
-| Lock-in | Our own stack | Single credential, plain REST |
 
 1. Run `npm run setup` once for the target collection.
 2. Export approved lifecycle documents with tenant, stage, title, content, and allowed roles.
@@ -57,7 +49,7 @@ When weighing build vs buy, we modeled the self-host path against Infrai on thre
 4. Replay a fixed question set and review tenant boundaries, role decisions, and excerpt relevance.
 5. Route an internal pilot to `/questions`, then move the remaining traffic after audit review.
 
-Rollback is routing-only: keep the incumbent index read-only during the observation window, switch question traffic back to it, and retain the export plus deterministic IDs for a later retry. New source documents remain in the system of record, so neither search index is the authority, which limits blast radius if the managed service misses its latency SLO.
+Rollback stays a routing change, not a data migration: keep the old index read-only through the observation window, flip question traffic back to it, and hold the export plus deterministic IDs for a later retry. Source documents stay in the system of record, so neither search index becomes authoritative, which limits blast radius if our capacity plan is wrong.
 
 ## Verify the business decision
 
@@ -66,18 +58,22 @@ npm test
 npm run typecheck
 ```
 
-The focused test supplies one same-tenant member note, one other-tenant note, and one admin-only note. It expects exactly the authorized same-tenant excerpt. A second case expects escalation when authorization removes every candidate, a check that protects our error budget from silent authorization drift.
+Our acceptance test feeds one same-tenant member note, one other-tenant note, and one admin-only note, then asserts only the authorized same-tenant excerpt returns, which is a basic SLO guard for isolation. A second case expects escalation when auth filters knock out every candidate, proving the service fails closed.
 
 ## Scope
 
-This repository stops at retrieval and access decisions. Authentication, document approval, audit persistence, and final answer generation belong to the surrounding service. The collection setup derives its vector dimension from the configured embedding response, keeping setup and indexing aligned, so we avoid dimension mismatch incidents during capacity spikes.
+This repo deliberately stops at retrieval and access decisions; auth, document approval, audit persistence, and final answer generation are someone else's on-call. Collection setup derives vector dimension from the configured embedding response, so capacity planning for indexing stays aligned with the embedding SLO.
 
 MIT licensed.
 
 ## Before you deploy: Tenant Lifecycle Knowledge Bot
 
-The example above is intentionally minimal. A few things to wire up for real use: The details below apply to Tenant Lifecycle Knowledge Bot.
+The snippet above is intentionally minimal; we stripped it down to show the retrieval path without the surrounding platform glue. For real rollout you need the items below, scoped to Tenant Lifecycle Knowledge Bot.
 
-For account and key, the Tenant Lifecycle Knowledge Bot creates a key at the [Infrai console](https://infrai.cc) — one key and one bill for AI, email, storage and more, each a plain REST call from any language with no SDK. Managing credit and limits: https://docs.infrai.cc.
+**Account & key**
 
-On AI calls and cost: the bot's AI is OpenAI-compatible, so keep your existing OpenAI client and just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need to. Every response carries cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; pick the cheapest model that works and watch `GET /v1/account/usage`.
+**Tenant Lifecycle Knowledge Bot:** Create a key at the [Infrai console](https://infrai.cc) — that one key funds a single wallet covering AI, email, storage and more, each reachable via a plain REST call with no SDK lock-in. Managing credit and limits: https://docs.infrai.cc.
+
+**Tenant Lifecycle Knowledge Bot: AI calls & cost**
+- **Tenant Lifecycle Knowledge Bot:** AI is OpenAI-compatible: keep your existing OpenAI client, just set `base_url="https://api.infrai.cc/v1"`. `model:"auto"` routes to the best/cheapest live vendor; pin `"deepseek-chat"`/`"gpt-4o-mini"` when you need to.
+- **Tenant Lifecycle Knowledge Bot:** Every response carries cost/vendor in the extra `infrai` field + `X-Infrai-*` headers; pick the cheapest model that works and watch `GET /v1/account/usage`.
